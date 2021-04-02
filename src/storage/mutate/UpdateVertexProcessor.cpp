@@ -39,6 +39,10 @@ void UpdateVertexProcessor::onProcessFinished(int32_t retNum) {
         };
         for (auto& exp : returnColumnsExp_) {
             auto value = exp->eval(getters);
+            if (!exp->prepare().ok()) {
+                LOG(ERROR) << "Expression::prepare failed";
+                return;
+            }
             if (!value.ok()) {
                 LOG(ERROR) << value.status();
                 return;
@@ -113,15 +117,25 @@ kvstore::ResultCode UpdateVertexProcessor::collectVertexProps(
             // load it. To protect the data, we just return failed to graphd.
             return kvstore::ResultCode::ERR_CORRUPT_DATA;
         }
-        const auto schema = reader->getSchema();
+        const auto schema = this->schemaMan_->getTagSchema(this->spaceId_, tagId);
+        if (schema == nullptr) {
+            LOG(ERROR) << "Can't find the schema for tagId " << tagId;
+            return kvstore::ResultCode::ERR_TAG_NOT_FOUND;
+        }
         for (auto& prop : props) {
+            VariantType v;
             auto res = RowReader::getPropByName(reader.get(), prop.prop_.name);
             if (!ok(res)) {
-                VLOG(1) << "Skip the bad value for tag: " << tagId
-                        << ", prop " << prop.prop_.name;
-                return kvstore::ResultCode::ERR_UNKNOWN;
+                auto defaultVal = schema->getDefaultValue(prop.prop_.name);
+                if (!defaultVal.ok()) {
+                    LOG(WARNING) << "No default value of "
+                                 << tagId << ", prop " << prop.prop_.name;
+                    return kvstore::ResultCode::ERR_TAG_NOT_FOUND;
+                }
+                v = std::move(defaultVal).value();
+            } else {
+                v = value(std::move(res));
             }
-            auto&& v = value(std::move(res));
             tagFilters_.emplace(std::make_pair(tagId, prop.prop_.name), v);
         }
         if (updateTagIds_.find(tagId) != updateTagIds_.end()) {
@@ -253,6 +267,10 @@ cpp2::ErrorCode UpdateVertexProcessor::checkFilter(const PartitionID partId, con
 
     if (!resp_.upsert && this->exp_ != nullptr) {
         auto filterResult = this->exp_->eval(getters);
+        if (!this->exp_->prepare().ok()) {
+            LOG(ERROR) << "Expression::prepare failed";
+            return cpp2::ErrorCode::E_INVALID_FILTER;
+        }
         if (!filterResult.ok()) {
             return cpp2::ErrorCode::E_INVALID_FILTER;
         }
@@ -301,6 +319,10 @@ folly::Optional<std::string> UpdateVertexProcessor::updateAndWriteBack(const Par
         }
         auto vexp = std::move(exp).value();
         vexp->setContext(this->expCtx_.get());
+        if (!vexp->prepare().ok()) {
+            LOG(ERROR) << "Expression::prepare failed";
+            return folly::none;
+        }
         auto value = vexp->eval(getters);
         if (!value.ok()) {
             LOG(ERROR) << value.status();
@@ -388,7 +410,8 @@ folly::Optional<std::string> UpdateVertexProcessor::updateAndWriteBack(const Par
         }
         auto nVal = std::move(status.value());
         if (!indexes_.empty()) {
-            std::unique_ptr<RowReader> reader, oReader;
+            RowReader reader = RowReader::getEmptyRowReader();
+            RowReader oReader = RowReader::getEmptyRowReader();
             for (auto &index : indexes_) {
                 if (index->get_schema_id().get_tag_id() == u.first) {
                     if (!(u.second->kv.second.empty())) {
@@ -469,7 +492,6 @@ cpp2::ErrorCode UpdateVertexProcessor::checkAndBuildContexts(
         }
     }
     auto vId = req.get_vertex_id();
-    auto partId = req.get_part_id();
     // build context of the update items
     for (auto& item : req.get_update_items()) {
         const auto &name = item.get_name();
@@ -488,7 +510,7 @@ cpp2::ErrorCode UpdateVertexProcessor::checkAndBuildContexts(
         auto tagId = tagRet.value();
         if (FLAGS_enable_vertex_cache && vertexCache_ != nullptr) {
             VLOG(3) << "Evict cache for vId " << vId << ", tagId " << tagId;
-            vertexCache_->evict(std::make_pair(req.get_vertex_id(), tagId), partId);
+            vertexCache_->evict(std::make_pair(req.get_vertex_id(), tagId));
         }
         updateTagIds_.emplace(tagId);
         auto exp = Expression::decode(item.get_value());

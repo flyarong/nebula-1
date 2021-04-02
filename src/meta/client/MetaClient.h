@@ -82,6 +82,9 @@ using SpaceTagIdNameMap = std::unordered_map<std::pair<GraphSpaceID, TagID>, std
 
 // get all edgeType edgeName via spaceId
 using SpaceAllEdgeMap = std::unordered_map<GraphSpaceID, std::vector<std::string>>;
+
+// get all tagId tagName via spaceId
+using SpaceAllTagMap = std::unordered_map<GraphSpaceID, std::vector<std::string>>;
 // get leader host via spaceId and partId
 using LeaderMap = std::unordered_map<std::pair<GraphSpaceID, PartitionID>, HostAddr>;
 
@@ -134,7 +137,7 @@ struct SpaceDesc {
 };
 
 
-// config cahce, get config via module and name
+// config cache, get config via module and name
 using MetaConfigMap = std::unordered_map<std::pair<cpp2::ConfigModule, std::string>, ConfigItem>;
 
 class MetaChangedListener {
@@ -399,7 +402,7 @@ public:
 
     folly::Future<StatusOr<std::vector<cpp2::Snapshot>>> listSnapshots();
 
-    // Opeartions for cache.
+    // Operations for cache.
     StatusOr<GraphSpaceID>
     getSpaceIdByNameFromCache(const std::string& name);
 
@@ -422,6 +425,9 @@ public:
 
     // get all lastest version edge
     StatusOr<std::vector<std::string>> getAllEdgeFromCache(const GraphSpaceID& space);
+
+    // get all lastest version tag
+    StatusOr<std::vector<std::string>> getAllTagFromCache(const GraphSpaceID& space);
 
     PartsMap getPartsMapFromCache(const HostAddr& host);
 
@@ -510,7 +516,8 @@ protected:
                      SpaceEdgeTypeNameMap &edgeTypeNamemap,
                      SpaceNewestTagVerMap &newestTagVerMap,
                      SpaceNewestEdgeVerMap &newestEdgeVerMap,
-                     SpaceAllEdgeMap &allEdgemap);
+                     SpaceAllEdgeMap &allEdgemap,
+                     SpaceAllTagMap &allTagmap);
 
     bool loadUsersAndRoles();
 
@@ -555,7 +562,7 @@ protected:
                      RemoteFunc remoteFunc,
                      RespGenerator respGen,
                      folly::Promise<StatusOr<Response>> pro,
-                     bool toLeader = false,
+                     bool toLeader = true,
                      int32_t retry = 0,
                      int32_t retryLimit = FLAGS_meta_client_retry_times);
 
@@ -589,6 +596,7 @@ private:
         SpaceNewestTagVerMap  spaceNewestTagVerMap_;
         SpaceNewestEdgeVerMap spaceNewestEdgeVerMap_;
         SpaceAllEdgeMap       spaceAllEdgeMap_;
+        SpaceAllTagMap        spaceAllTagMap_;
     };
 
     const ThreadLocalInfo& getThreadLocalInfo();
@@ -610,6 +618,7 @@ private:
     SpaceNewestTagVerMap  spaceNewestTagVerMap_;
     SpaceNewestEdgeVerMap spaceNewestEdgeVerMap_;
     SpaceAllEdgeMap       spaceAllEdgeMap_;
+    SpaceAllTagMap        spaceAllTagMap_;
 
     UserRolesMap          userRolesMap_;
     UserPasswordMap       userPasswordMap_;

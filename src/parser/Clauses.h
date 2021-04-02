@@ -182,11 +182,16 @@ public:
         return ref_.get();
     }
 
+    void setContext(ExpressionContext *context) {
+        expCtx_ = context;
+    }
+
     Status prepare(Vertices &vertices) const;
 
 protected:
     std::unique_ptr<VertexIDList>               vidList_;
     std::unique_ptr<Expression>                 ref_;
+    ExpressionContext                          *expCtx_{nullptr};
 };
 
 class FromClause final : public VerticesClause {
@@ -252,6 +257,23 @@ public:
 
 private:
     std::vector<std::unique_ptr<OverEdge>> edges_;
+};
+
+class FetchLabels final {
+public:
+    void addLabel(std::string *label) { labels_.emplace_back(label); }
+
+    std::vector<std::string *> labels() {
+        std::vector<std::string *> result;
+        std::transform(labels_.cbegin(), labels_.cend(),
+                       std::insert_iterator<std::vector<std::string *>>(result, result.begin()),
+                       [](auto &label) { return label.get(); });
+        return result;
+    }
+
+    std::string toString() const;
+private:
+    std::vector<std::unique_ptr<std::string>> labels_;
 };
 
 class OverClause final : public Clause {

@@ -60,7 +60,10 @@ FileBasedWal::FileBasedWal(const folly::StringPiece dir,
                   << ", path is " << info->path();
         currFd_ = open(info->path(), O_WRONLY | O_APPEND);
         currInfo_ = info;
-        CHECK_GE(currFd_, 0);
+        if (currFd_ < 0) {
+            LOG(FATAL) << "Failed to open the file \"" << info->path() << "\" ("
+                       << errno << "): " << strerror(errno);
+        }
     }
 }
 
@@ -617,6 +620,13 @@ bool FileBasedWal::linkCurrentWAL(const char* newPath) {
         LOG(INFO) << idStr_ << "No wal files found, skip link";
         return true;
     }
+
+    if (fs::FileUtils::exist(newPath) &&
+        !fs::FileUtils::remove(newPath, true)) {
+        LOG(ERROR) << "Remove exist dir failed of wal : " << newPath;
+        return false;
+    }
+
     if (!fs::FileUtils::makeDir(newPath)) {
         LOG(INFO) << idStr_ << "Link file parent dir make failed : " << newPath;
         return false;
@@ -723,14 +733,20 @@ void FileBasedWal::cleanWAL(int32_t ttl) {
         return;
     }
     auto now = time::WallClock::fastNowInSec();
-    // We skip the latest wal file because it is beging written now.
+    // In theory we only need to keep the latest wal file because it is beging written now.
+    // However, sometimes will trigger raft snapshot even only a small amount of logs is missing,
+    // especially when we reboot all storage, so se keep one more wal.
     size_t index = 0;
     auto it = walFiles_.begin();
     auto size = walFiles_.size();
+    if (size < 2) {
+        return;
+    }
     int count = 0;
     int walTTL = ttl == 0 ? policy_.ttl : ttl;
     while (it != walFiles_.end()) {
-        if (index++ < size - 1 &&  (now - it->second->mtime() > walTTL)) {
+        // keep at least two wal
+        if (index++ < size - 2 && (now - it->second->mtime() > walTTL)) {
             VLOG(1) << "Clean wals, Remove " << it->second->path() << ", now: " << now
                     << ", mtime: " << it->second->mtime();
             unlink(it->second->path());

@@ -23,6 +23,14 @@ class QueryResponse;
 
 namespace graph {
 
+struct HashPair {
+    template <class T1, class T2> size_t operator()(const std::pair<T1, T2>& p) const {
+        auto hash1 = std::hash<T1>{}(p.first);
+        auto hash2 = std::hash<T2>{}(p.second);
+        return hash1 ^ hash2;
+    }
+};
+
 class GoExecutor final : public TraverseExecutor {
 public:
     GoExecutor(Sentence *sentence, ExecutionContext *ectx);
@@ -77,25 +85,6 @@ private:
         return curStep_ >= recordFrom_ && curStep_ <= steps_;
     }
 
-    bool yieldInput() const {
-        for (const auto col : yields_) {
-            if (col->expr()->fromVarInput()) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    VertexID getRoot(VertexID srcId, std::size_t record) const {
-        CHECK_GT(record, 0);
-        VertexID rootId = srcId;
-        if (record == 1) {
-            return rootId;
-        }
-        rootId = DCHECK_NOTNULL(backTracker_)->get(srcId);
-        return rootId;
-    }
-
     /**
      * To obtain the source ids from various places,
      * such as the literal id list, inputs from the pipeline or results of variable.
@@ -141,6 +130,8 @@ private:
     std::vector<VertexID> getDstIdsFromResps(std::vector<RpcResponse>::iterator begin,
                                              std::vector<RpcResponse>::iterator end) const;
 
+    std::vector<VertexID> getDstIdsFromRespWithBackTrack(const RpcResponse &rpcResp) const;
+
     /**
      * get the edgeName when over all edges
      */
@@ -183,36 +174,36 @@ private:
      */
     class VertexHolder final {
     public:
+        explicit VertexHolder(ExecutionContext* ectx) : ectx_(ectx) { }
         OptVariantType getDefaultProp(TagID tid, const std::string &prop) const;
         OptVariantType get(VertexID id, TagID tid, const std::string &prop) const;
-        void add(const storage::cpp2::QueryResponse &resp);
-        nebula::cpp2::SupportedType getDefaultPropType(TagID tid, const std::string &prop) const;
-        nebula::cpp2::SupportedType getType(VertexID id, TagID tid, const std::string &prop);
+        void add(const std::vector<storage::cpp2::QueryResponse> &responses);
 
     private:
-        using VData = std::tuple<std::shared_ptr<ResultSchemaProvider>, std::string>;
-        std::unordered_map<VertexID, std::unordered_map<TagID, VData>> data_;
+        std::unordered_map<std::pair<VertexID, TagID>, RowReader> data_;
+        mutable std::unordered_map<
+            TagID, std::shared_ptr<const meta::SchemaProviderIf>> tagSchemaMap_;
+        ExecutionContext* ectx_{nullptr};
     };
 
     class VertexBackTracker final {
     public:
-        void add(VertexID src, VertexID dst) {
-            VertexID value = src;
-            auto iter = mapping_.find(src);
-            if (iter != mapping_.end()) {
-                value = iter->second;
+        void inject(const std::unordered_set<std::pair<VertexID, VertexID>, HashPair> &backTrace,
+                uint32_t curStep) {
+            // TODO(shylock) c++17 merge directly
+            for (const auto iter : backTrace) {
+                mapping_.emplace(std::pair<uint32_t, VertexID>(curStep, iter.first), iter.second);
             }
-            mapping_[dst] = value;
         }
 
-        VertexID get(VertexID id) {
-            auto iter = mapping_.find(id);
-            DCHECK(iter != mapping_.end());
-            return iter->second;
+        auto get(uint32_t curStep, VertexID id) const {
+            auto range = mapping_.equal_range(std::pair<uint32_t, VertexID>(curStep, id));
+            return range;
         }
 
     private:
-         std::unordered_map<VertexID, VertexID>     mapping_;
+        // Record the path from the dst node of each step to the root node.((curStep,dstID),rootID)
+        std::multimap<std::pair<uint32_t, VertexID>, VertexID> mapping_;
     };
 
     enum FromType {
@@ -223,6 +214,21 @@ private:
 
     // Join the RPC response to previous data
     void joinResp(RpcResponse &&resp);
+
+    std::vector<VertexID> getRoots(VertexID srcId, std::size_t record) const {
+        CHECK_GT(record, 0);
+        std::vector<VertexID> ids;
+        if (record == 1) {
+            ids.emplace_back(srcId);
+            return ids;
+        }
+        const auto range = DCHECK_NOTNULL(backTracker_)->get(record - 1, srcId);
+        for (auto i = range.first; i != range.second; ++i) {
+            ids.emplace_back(i->second);
+        }
+        return ids;
+    }
+
 
 private:
     GoSentence                                 *sentence_{nullptr};
@@ -250,6 +256,7 @@ private:
     std::vector<RpcResponse>                    records_;
     // The name of Tag or Edge, index of prop in data
     using SchemaPropIndex = std::unordered_map<std::pair<std::string, std::string>, int64_t>;
+    std::string                                  warningMsg_;
 };
 
 }   // namespace graph

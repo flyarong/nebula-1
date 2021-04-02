@@ -9,6 +9,7 @@
 #include "base/Base.h"
 #include "base/StatusOr.h"
 #include "base/Status.h"
+#include "base/ICord.h"
 #include "storage/client/StorageClient.h"
 #include "filter/FunctionManager.h"
 #include <boost/variant.hpp>
@@ -16,7 +17,6 @@
 
 namespace nebula {
 
-class Cord;
 using OptVariantType = StatusOr<VariantType>;
 
 enum class ColumnType : uint8_t {
@@ -116,6 +116,14 @@ public:
 
     std::vector<PropPair> aliasProps() const {
         return std::vector<PropPair>(aliasProps_.begin(), aliasProps_.end());
+    }
+
+    std::unordered_set<std::string> edgeNamesInExpr() const {
+        std::unordered_set<std::string> edgeNames;
+        for (auto& kv : aliasProps_) {
+            edgeNames.emplace(kv.first);
+        }
+        return edgeNames;
     }
 
     using VariableProp = std::pair<std::string, std::string>;
@@ -442,7 +450,7 @@ private:
     friend class VariablePropertyExpression;
     friend class InputPropertyExpression;
 
-    virtual void encode(Cord &cord) const = 0;
+    virtual void encode(ICord<> &cord) const = 0;
     /*
      * Decode an expression from within a buffer [pos, end).
      * Return a pointer to where the decoding consumed up.
@@ -489,7 +497,7 @@ public:
     }
 
 private:
-    void encode(Cord &cord) const override;
+    void encode(ICord<> &cord) const override;
     const char* decode(const char *pos, const char *end) override;
 
 protected:
@@ -690,7 +698,7 @@ public:
     Status MUST_USE_RESULT prepare() override;
 
 private:
-    void encode(Cord &cord) const override;
+    void encode(ICord<> &cord) const override;
 
     const char* decode(const char *pos, const char *end) override;
 
@@ -760,7 +768,7 @@ public:
     }
 
 private:
-    void encode(Cord &cord) const override;
+    void encode(ICord<> &cord) const override;
 
     const char* decode(const char *pos, const char *end) override;
 
@@ -795,7 +803,7 @@ public:
     }
 
 private:
-    void encode(Cord &) const override {
+    void encode(ICord<> &) const override {
         throw Status::Error("Not supported yet");
     }
 
@@ -843,7 +851,7 @@ public:
     }
 
 private:
-    void encode(Cord &cord) const override;
+    void encode(ICord<> &cord) const override;
 
     const char* decode(const char *pos, const char *end) override;
 
@@ -888,7 +896,7 @@ public:
     }
 
 private:
-    void encode(Cord &cord) const override;
+    void encode(ICord<> &cord) const override;
 
     const char* decode(const char *, const char *) override;
 
@@ -940,7 +948,7 @@ public:
     }
 
 private:
-    void encode(Cord &cord) const override;
+    void encode(ICord<> &cord) const override;
 
     const char* decode(const char *pos, const char *end) override;
 
@@ -997,7 +1005,7 @@ public:
     }
 
 private:
-    void encode(Cord &cord) const override;
+    void encode(ICord<> &cord) const override;
 
     const char* decode(const char *pos, const char *end) override;
 
@@ -1064,7 +1072,7 @@ public:
     }
 
 private:
-    void encode(Cord &cord) const override;
+    void encode(ICord<> &cord) const override;
 
     const char* decode(const char *pos, const char *end) override;
 

@@ -261,6 +261,27 @@ nebula_add_test(
 
 nebula_add_test(
     NAME
+        storage_http_stats_test
+    SOURCES
+        StorageHttpStatsHandlerTest.cpp
+    OBJECTS
+        $<TARGET_OBJECTS:storage_http_handler>
+        $<TARGET_OBJECTS:http_client_obj>
+        $<TARGET_OBJECTS:ws_obj>
+        $<TARGET_OBJECTS:ws_common_obj>
+        $<TARGET_OBJECTS:process_obj>
+        ${storage_test_deps}
+    LIBRARIES
+        proxygenhttpserver
+        proxygenlib
+        ${ROCKSDB_LIBRARIES}
+        ${THRIFT_LIBRARIES}
+        wangle
+        gtest
+)
+
+nebula_add_test(
+    NAME
         compaction_test
     SOURCES
         CompactionTest.cpp
@@ -287,6 +308,54 @@ nebula_add_executable(
         follybenchmark
         wangle
         boost_regex
+)
+
+nebula_add_executable(
+    NAME
+        prefix_bloom_filter_bm
+    SOURCES
+        PrefixBloomFilterBenchmark.cpp
+    OBJECTS
+        ${storage_test_deps}
+    LIBRARIES
+        ${ROCKSDB_LIBRARIES}
+        ${THRIFT_LIBRARIES}
+        follybenchmark
+        wangle
+        boost_regex
+)
+
+
+nebula_add_executable(
+    NAME
+        get_neighbors_bm
+    SOURCES
+        GetNeighborsBenchmark.cpp
+    OBJECTS
+        ${storage_test_deps}
+    LIBRARIES
+        ${ROCKSDB_LIBRARIES}
+        ${THRIFT_LIBRARIES}
+        follybenchmark
+        wangle
+        boost_regex
+)
+
+
+nebula_add_test(
+    NAME
+        add_update_vertex_edge_bm
+    SOURCES
+        AddAndUpdateVertexAndEdgeBenchmark.cpp
+    OBJECTS
+        ${storage_test_deps}
+    LIBRARIES
+        ${ROCKSDB_LIBRARIES}
+        ${THRIFT_LIBRARIES}
+        follybenchmark
+        wangle
+        boost_regex
+        gtest
 )
 
 
@@ -405,9 +474,9 @@ nebula_add_executable(
         gtest
 )
 
-nebula_add_test(    
+nebula_add_test(
     NAME
-        index_scan_test    
+        index_scan_test
     SOURCES
         IndexScanTest.cpp
     OBJECTS
@@ -416,7 +485,7 @@ nebula_add_test(
         ${ROCKSDB_LIBRARIES}
         ${THRIFT_LIBRARIES}
         wangle
-        gtest 
+        gtest
 )
 
 nebula_add_executable(
@@ -427,6 +496,22 @@ nebula_add_executable(
     OBJECTS
         ${storage_test_deps}
     LIBRARIES
+        ${ROCKSDB_LIBRARIES}
+        ${THRIFT_LIBRARIES}
+        follybenchmark
+        boost_regex
+        wangle
+        gtest
+)
+
+nebula_add_executable(
+        NAME
+        storage_lookup_concurrently_bm
+        SOURCES
+        StorageLookupConcurrentlyBenchmark.cpp
+        OBJECTS
+        ${storage_test_deps}
+        LIBRARIES
         ${ROCKSDB_LIBRARIES}
         ${THRIFT_LIBRARIES}
         follybenchmark

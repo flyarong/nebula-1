@@ -102,6 +102,11 @@ void GoExecutor::execute() {
         onEmptyInputs();
         return;
     }
+    // record means the reponse index [1, steps]
+    if (recordFrom_ == 0) {
+        recordFrom_ = 1;
+        CHECK_GE(steps_, recordFrom_);
+    }
 
     status = setupStarts();
     if (!status.ok()) {
@@ -488,7 +493,7 @@ Status GoExecutor::setupStarts() {
     if (!status.ok()) {
         return status;
     }
-    auto result = inputs->getVIDs(*colname_);
+    auto result = inputs->getDistinctVIDs(*colname_);
     if (!result.ok()) {
         LOG(ERROR) << "Get vid fail: " << *colname_;
         return std::move(result).status();
@@ -549,6 +554,7 @@ void GoExecutor::stepOut() {
                 LOG(ERROR) << "part: " << error.first
                            << "error code: " << static_cast<int>(error.second);
             }
+            warningMsg_ = "Go executor was partially performed";
         }
         if (FLAGS_trace_go) {
             LOG(INFO) << "Step:" << curStep_
@@ -584,10 +590,12 @@ void GoExecutor::stepOut() {
 void GoExecutor::onStepOutResponse(RpcResponse &&rpcResp) {
     joinResp(std::move(rpcResp));
 
+    // back trace each step
+    CHECK_GT(records_.size(), 0);
+    auto dsts = getDstIdsFromRespWithBackTrack(records_.back());
     if (isFinalStep()) {
         GO_EXIT();
     } else {
-        auto dsts = getDstIdsFromResps(records_.end() - 1, records_.end());
         starts_ = std::move(dsts);
         if (starts_.empty()) {
             GO_EXIT();
@@ -610,6 +618,8 @@ void GoExecutor::maybeFinishExecution() {
         return;
     }
 
+    CHECK_GT(recordFrom_, 0);
+    CHECK_GE(records_.size(), recordFrom_ - 1) << "Current step " << curStep_;
     auto dstIds = getDstIdsFromResps(records_.begin() + recordFrom_ - 1, records_.end());
 
     // Reaching the dead end
@@ -630,26 +640,79 @@ void GoExecutor::onVertexProps(RpcResponse &&rpcResp) {
 
 std::vector<VertexID> GoExecutor::getDstIdsFromResps(std::vector<RpcResponse>::iterator begin,
                                                      std::vector<RpcResponse>::iterator end) const {
-    std::unordered_set<VertexID> set;
+    size_t num = 0;
     for (auto it = begin; it != end; ++it) {
         for (const auto &resp : it->responses()) {
-            auto *vertices = resp.get_vertices();
-            if (vertices == nullptr) {
+            if (!resp.__isset.vertices) {
+                continue;
+            }
+            num += resp.vertices.size();
+        }
+    }
+
+    std::unordered_set<VertexID> set;
+    set.reserve(num);
+
+    for (auto it = begin; it != end; ++it) {
+        for (const auto &resp : it->responses()) {
+            if (!resp.__isset.vertices) {
                 continue;
             }
 
-            for (const auto &vdata : *vertices) {
+            for (const auto &vdata : resp.vertices) {
                 for (const auto &edata : vdata.edge_data) {
                     for (const auto& edge : edata.get_edges()) {
                         auto dst = edge.get_dst();
-                        if (!isFinalStep() && backTracker_ != nullptr) {
-                            backTracker_->add(vdata.get_vertex_id(), dst);
-                        }
                         set.emplace(dst);
                     }
                 }
             }
         }
+    }
+    return std::vector<VertexID>(set.begin(), set.end());
+}
+
+std::vector<VertexID> GoExecutor::getDstIdsFromRespWithBackTrack(const RpcResponse &rpcResp) const {
+    // back trace in current step
+    // To avoid overlap in current step edges
+    // For example
+    // Dst , Src
+    // 6  ,  1
+    // 7  ,  6
+    // Will mistake lead to 7->6 if insert edge(dst, src) one by one
+    // So read all roots of current step first , then insert them
+    std::unordered_set<std::pair<VertexID, VertexID>, HashPair> curBackTrace;
+    std::unordered_set<VertexID> set;
+    for (const auto &resp : rpcResp.responses()) {
+        if (!resp.__isset.vertices) {
+            continue;
+        }
+
+        for (const auto &vdata : resp.vertices) {
+            for (const auto &edata : vdata.edge_data) {
+                for (const auto& edge : edata.get_edges()) {
+                    auto dst = edge.get_dst();
+                    if (!isFinalStep() && backTracker_ != nullptr) {
+                        // vertex_id is rootID
+                        if (curStep_ == 1) {
+                            auto key = std::pair<VertexID, VertexID>(dst, vdata.get_vertex_id());
+                            curBackTrace.emplace(key);
+                        } else {
+                            // find rootID from preStep
+                            auto preRange = backTracker_->get(curStep_ - 1, vdata.get_vertex_id());
+                            for (auto trace = preRange.first; trace != preRange.second; ++trace) {
+                                auto key = std::pair<VertexID, VertexID>(dst, trace->second);
+                                curBackTrace.emplace(key);
+                            }
+                        }
+                    }
+                    set.emplace(dst);
+                }
+            }
+        }
+    }
+    if (!isFinalStep() && backTracker_ != nullptr) {
+        backTracker_->inject(curBackTrace, curStep_);
     }
     return std::vector<VertexID>(set.begin(), set.end());
 }
@@ -667,7 +730,9 @@ void GoExecutor::finishExecution() {
             yc.emplace_back(std::move(ptr));
         }
     }
-
+    if (!warningMsg_.empty()) {
+        ectx()->addWarningMsg(warningMsg_);
+    }
 
     if (onResult_) {
         std::unique_ptr<InterimResult> outputs;
@@ -698,6 +763,7 @@ void GoExecutor::finishExecution() {
 StatusOr<std::vector<cpp2::RowValue>> GoExecutor::toThriftResponse() const {
     std::vector<cpp2::RowValue> rows;
     int64_t totalRows = 0;
+    CHECK_GT(recordFrom_, 0);
     for (auto rpcResp = records_.begin() + recordFrom_ - 1; rpcResp != records_.end(); ++rpcResp) {
         for (const auto& resp : rpcResp->responses()) {
             if (resp.get_total_edges() != nullptr) {
@@ -878,7 +944,7 @@ void GoExecutor::fetchVertexProps(std::vector<VertexID> ids) {
     auto returns = status.value();
     auto future = ectx()->getStorageClient()->getVertexProps(spaceId, ids, returns);
     auto *runner = ectx()->rctx()->runner();
-    auto cb = [this] (auto &&result) mutable {
+    auto cb = [this, ectx = ectx()] (auto &&result) mutable {
         auto completeness = result.completeness();
         if (completeness == 0) {
             doError(Status::Error("Get dest props failed"));
@@ -889,13 +955,12 @@ void GoExecutor::fetchVertexProps(std::vector<VertexID> ids) {
                 LOG(ERROR) << "part: " << error.first
                            << "error code: " << static_cast<int>(error.second);
             }
+            warningMsg_ = "Go executor was partially performed";
         }
         if (vertexHolder_ == nullptr) {
-            vertexHolder_ = std::make_unique<VertexHolder>();
+            vertexHolder_ = std::make_unique<VertexHolder>(ectx);
         }
-        for (auto &resp : result.responses()) {
-            vertexHolder_->add(resp);
-        }
+        vertexHolder_->add(result.responses());
         finishExecution();
         return;
     };
@@ -1015,7 +1080,6 @@ void GoExecutor::onEmptyInputs() {
 }
 
 bool GoExecutor::processFinalResult(Callback cb) const {
-    const bool joinInput = yieldInput();
     auto uniqResult = std::make_unique<std::unordered_set<size_t>>();
     auto spaceId = ectx()->rctx()->session()->space();
     std::vector<SupportedType> colTypes;
@@ -1023,6 +1087,138 @@ bool GoExecutor::processFinalResult(Callback cb) const {
         colTypes.emplace_back(calculateExprType(column->expr()));
     }
     std::size_t recordIn = recordFrom_;
+    CHECK_GT(recordFrom_, 0);
+
+    VertexID srcId = 0;
+    VertexID dstId = 0;
+    EdgeType edgeType = 0;
+    uint32_t inputRow = 0;
+    RowReader reader = RowReader::getEmptyRowReader();
+    std::unordered_map<TagID, std::shared_ptr<ResultSchemaProvider>> tagSchema;
+    std::unordered_map<EdgeType, std::shared_ptr<ResultSchemaProvider>> edgeSchema;
+    const std::vector< ::nebula::storage::cpp2::TagData>* tagData = nullptr;
+
+    Getters getters;
+    getters.getEdgeDstId = [this, &dstId, &edgeType] (
+        const std::string& edgeName) -> OptVariantType {
+        if (edgeTypes_.size() > 1) {
+            EdgeType type;
+            auto found = expCtx_->getEdgeType(edgeName, type);
+            if (!found) {
+                return Status::Error(
+                    "Get edge type for `%s' failed in getters.",
+                    edgeName.c_str());
+            }
+            if (type != std::abs(edgeType)) {
+                return 0L;
+            }
+        }
+        return dstId;
+    };
+
+    getters.getSrcTagProp = [&spaceId, &tagData, &tagSchema, this] (
+        const std::string &tag, const std::string &prop) -> OptVariantType {
+        TagID tagId;
+        auto found = expCtx_->getTagId(tag, tagId);
+        if (!found) {
+            return Status::Error(
+                "Get tag id for `%s' failed in getters.", tag.c_str());
+        }
+
+        auto it2 = std::find_if(tagData->cbegin(),
+                                tagData->cend(),
+                                [&tagId] (auto &td) {
+                                    if (td.tag_id == tagId) {
+                                        return true;
+                                    }
+                                    return false;
+                                });
+        if (it2 == tagData->cend()) {
+            auto ts = ectx()->schemaManager()->getTagSchema(spaceId, tagId);
+            if (ts == nullptr) {
+                return Status::Error("No tag schema for %s", tag.c_str());
+            }
+            return RowReader::getDefaultProp(ts.get(), prop);
+        }
+        DCHECK(it2->__isset.data);
+        auto vreader = RowReader::getRowReader(it2->data, tagSchema[tagId]);
+        auto res = RowReader::getPropByName(vreader.get(), prop);
+        if (!ok(res)) {
+            return Status::Error("get prop(%s.%s) failed",
+                                 tag.c_str(),
+                                 prop.c_str());
+        }
+        return value(res);
+    };
+
+    // In reverse mode, it is used to get the src props.
+    getters.getDstTagProp = [&spaceId, &dstId, this] (
+        const std::string &tag, const std::string &prop) -> OptVariantType {
+        TagID tagId;
+        auto found = expCtx_->getTagId(tag, tagId);
+        if (!found) {
+            return Status::Error(
+                "Get tag id for `%s' failed in getters.", tag.c_str());
+        }
+        auto ret = vertexHolder_->get(dstId, tagId, prop);
+        if (!ret.ok()) {
+            auto ts = ectx()->schemaManager()->getTagSchema(spaceId, tagId);
+            if (ts == nullptr) {
+                return Status::Error("No tag schema for %s", tag.c_str());
+            }
+            return RowReader::getDefaultProp(ts.get(), prop);
+        }
+        return ret.value();
+    };
+
+    getters.getVariableProp = [&inputRow, this] (const std::string &prop) {
+        return index_->getColumnWithRow(inputRow, prop);
+    };
+
+    getters.getInputProp = [&inputRow, this] (const std::string &prop) {
+        return index_->getColumnWithRow(inputRow, prop);
+    };
+
+    // In reverse mode, we should handle _src
+    getters.getAliasProp = [&reader, &srcId, &edgeType, &edgeSchema, this] (
+        const std::string &edgeName, const std::string &prop) mutable -> OptVariantType {
+        EdgeType type;
+        auto found = expCtx_->getEdgeType(edgeName, type);
+        if (!found) {
+            return Status::Error(
+                "Get edge type for `%s' failed in getters.",
+                edgeName.c_str());
+        }
+        if (std::abs(edgeType) != type) {
+            auto sit = edgeSchema.find(
+                direction_ ==
+                OverClause::Direction::kBackward ? -type : type);
+            if (sit == edgeSchema.end()) {
+                std::string errMsg = folly::stringPrintf(
+                    "Can't find shcema for %s when get default.",
+                    edgeName.c_str());
+                LOG(ERROR) << errMsg;
+                return Status::Error(errMsg);
+            }
+            return RowReader::getDefaultProp(sit->second.get(), prop);
+        }
+
+        if (prop == _SRC) {
+            return srcId;
+        }
+        DCHECK(reader != nullptr);
+        auto res = RowReader::getPropByName(reader.get(), prop);
+        if (!ok(res)) {
+            LOG(ERROR) << "Can't get prop for " << prop
+                       << ", edge " << edgeName;
+            return Status::Error(
+                folly::sformat("get prop({}.{}) failed",
+                               edgeName,
+                               prop));
+        }
+        return value(std::move(res));
+    };  // getAliasProp
+
     for (auto rpcResp = records_.begin() + recordFrom_ - 1;
          rpcResp != records_.end();
          ++rpcResp, ++recordIn) {
@@ -1034,7 +1230,6 @@ bool GoExecutor::processFinalResult(Callback cb) const {
             if (resp.get_vertices() == nullptr) {
                 continue;
             }
-            std::unordered_map<TagID, std::shared_ptr<ResultSchemaProvider>> tagSchema;
             auto *vschema = resp.get_vertex_schema();
             if (vschema != nullptr) {
                 std::transform(vschema->cbegin(), vschema->cend(),
@@ -1045,7 +1240,6 @@ bool GoExecutor::processFinalResult(Callback cb) const {
                             });
             }
 
-            std::unordered_map<EdgeType, std::shared_ptr<ResultSchemaProvider>> edgeSchema;
             auto *eschema = resp.get_edge_schema();
             if (eschema != nullptr) {
                 std::transform(eschema->cbegin(), eschema->cend(),
@@ -1059,25 +1253,12 @@ bool GoExecutor::processFinalResult(Callback cb) const {
             for (const auto &vdata : resp.vertices) {
                 DCHECK(vdata.__isset.edge_data);
                 VLOG(1) << "Total vdata.edge_data size " << vdata.edge_data.size();
-                auto tagData = vdata.get_tag_data();
-                auto srcId = vdata.get_vertex_id();
-                const auto rootId = getRoot(srcId, recordIn);
-                auto inputRows = index_->rowsOfVid(rootId);
-                // Here if join the input we extend the input rows coresponding to current vertex;
-                // Or just loop once as previous that not join anything,
-                // in fact result what in responses.
-                bool notJoinOnce = false;
-                for (auto inputRow = inputRows.first;
-                     !joinInput || inputRow != inputRows.second;
-                     joinInput ? ++inputRow : inputRow) {
-                    if (!joinInput) {
-                        if (notJoinOnce) {
-                            break;
-                        }
-                        notJoinOnce = true;
-                    }
+                tagData = &vdata.get_tag_data();
+                srcId = vdata.get_vertex_id();
+
+                auto func = [&] () mutable {
                     for (const auto &edata : vdata.edge_data) {
-                        auto edgeType = edata.type;
+                        edgeType = edata.type;
                         VLOG(1) << "Total edata.edges size " << edata.edges.size()
                                 << ", for edge " << edgeType;
                         std::shared_ptr<ResultSchemaProvider> currEdgeSchema;
@@ -1087,141 +1268,12 @@ bool GoExecutor::processFinalResult(Callback cb) const {
                         }
                         VLOG(1) << "CurrEdgeSchema is null? " << (currEdgeSchema == nullptr);
                         for (const auto& edge : edata.edges) {
-                            auto dstId = edge.get_dst();
-                            Getters getters;
-                            getters.getEdgeDstId = [this,
-                                                    &dstId,
-                                                    &edgeType] (const std::string& edgeName)
-                                                                    -> OptVariantType {
-                                if (edgeTypes_.size() > 1) {
-                                    EdgeType type;
-                                    auto found = expCtx_->getEdgeType(edgeName, type);
-                                    if (!found) {
-                                        return Status::Error(
-                                                "Get edge type for `%s' failed in getters.",
-                                                edgeName.c_str());
-                                    }
-                                    if (type != std::abs(edgeType)) {
-                                        return 0L;
-                                    }
-                                }
-                                return dstId;
-                            };
-                            getters.getSrcTagProp = [&spaceId,
-                                                    &tagData,
-                                                    &tagSchema,
-                                                    this] (const std::string &tag,
-                                                       const std::string &prop) -> OptVariantType {
-                                TagID tagId;
-                                auto found = expCtx_->getTagId(tag, tagId);
-                                if (!found) {
-                                    return Status::Error(
-                                            "Get tag id for `%s' failed in getters.", tag.c_str());
-                                }
-
-                                auto it2 = std::find_if(tagData.cbegin(),
-                                                        tagData.cend(),
-                                                        [&tagId] (auto &td) {
-                                    if (td.tag_id == tagId) {
-                                        return true;
-                                    }
-                                    return false;
-                                });
-                                if (it2 == tagData.cend()) {
-                                    auto ts = ectx()->schemaManager()->getTagSchema(spaceId, tagId);
-                                    if (ts == nullptr) {
-                                        return Status::Error("No tag schema for %s", tag.c_str());
-                                    }
-                                    return RowReader::getDefaultProp(ts.get(), prop);
-                                }
-                                DCHECK(it2->__isset.data);
-                                auto vreader = RowReader::getRowReader(it2->data, tagSchema[tagId]);
-                                auto res = RowReader::getPropByName(vreader.get(), prop);
-                                if (!ok(res)) {
-                                    return Status::Error("get prop(%s.%s) failed",
-                                                         tag.c_str(),
-                                                         prop.c_str());
-                                }
-                                return value(res);
-                            };
-                            // In reverse mode, it is used to get the src props.
-                            getters.getDstTagProp = [&spaceId,
-                                                    &dstId,
-                                                    this] (const std::string &tag,
-                                                        const std::string &prop) -> OptVariantType {
-                                TagID tagId;
-                                auto found = expCtx_->getTagId(tag, tagId);
-                                if (!found) {
-                                    return Status::Error(
-                                            "Get tag id for `%s' failed in getters.", tag.c_str());
-                                }
-                                auto ret = vertexHolder_->get(dstId, tagId, prop);
-                                if (!ret.ok()) {
-                                    auto ts = ectx()->schemaManager()->getTagSchema(spaceId, tagId);
-                                    if (ts == nullptr) {
-                                        return Status::Error("No tag schema for %s", tag.c_str());
-                                    }
-                                    return RowReader::getDefaultProp(ts.get(), prop);
-                                }
-                                return ret.value();
-                            };
-                            getters.getVariableProp = [inputRow, this] (const std::string &prop) {
-                                return index_->getColumnWithRow(inputRow->second, prop);
-                            };
-
-                            getters.getInputProp = [inputRow, this] (const std::string &prop) {
-                                return index_->getColumnWithRow(inputRow->second, prop);
-                            };
-
-                            std::unique_ptr<RowReader> reader;
+                            dstId = edge.get_dst();
                             if (currEdgeSchema) {
                                 reader = RowReader::getRowReader(edge.props, currEdgeSchema);
+                            } else {
+                                reader = RowReader::getEmptyRowReader();
                             }
-
-                            // In reverse mode, we should handle _src
-                            getters.getAliasProp = [&reader,
-                                                    &srcId,
-                                                    &edgeType,
-                                                    &edgeSchema,
-                                                    this] (const std::string &edgeName,
-                                                        const std::string &prop) mutable
-                                                                        -> OptVariantType {
-                                EdgeType type;
-                                auto found = expCtx_->getEdgeType(edgeName, type);
-                                if (!found) {
-                                    return Status::Error(
-                                        "Get edge type for `%s' failed in getters.",
-                                        edgeName.c_str());
-                                }
-                                if (std::abs(edgeType) != type) {
-                                    auto sit = edgeSchema.find(
-                                        direction_ ==
-                                        OverClause::Direction::kBackward ? -type : type);
-                                    if (sit == edgeSchema.end()) {
-                                        std::string errMsg = folly::stringPrintf(
-                                                "Can't find shcema for %s when get default.",
-                                                edgeName.c_str());
-                                        LOG(ERROR) << errMsg;
-                                        return Status::Error(errMsg);
-                                    }
-                                    return RowReader::getDefaultProp(sit->second.get(), prop);
-                                }
-
-                                if (prop == _SRC) {
-                                    return srcId;
-                                }
-                                DCHECK(reader != nullptr);
-                                auto res = RowReader::getPropByName(reader.get(), prop);
-                                if (!ok(res)) {
-                                    LOG(ERROR) << "Can't get prop for " << prop
-                                            << ", edge " << edgeName;
-                                    return Status::Error(
-                                            folly::sformat("get prop({}.{}) failed",
-                                                        edgeName,
-                                                        prop));
-                                }
-                                return value(std::move(res));
-                            };  // getAliasProp
                             // Evaluate filter
                             if (whereWrapper_->filter_ != nullptr) {
                                 auto value = whereWrapper_->filter_->eval(getters);
@@ -1246,7 +1298,7 @@ bool GoExecutor::processFinalResult(Callback cb) const {
                             // Check if duplicate
                             if (distinct_) {
                                 auto ret = uniqResult->emplace(boost::hash_range(record.begin(),
-                                                                                record.end()));
+                                                                                 record.end()));
                                 if (!ret.second) {
                                     continue;
                                 }
@@ -1259,50 +1311,52 @@ bool GoExecutor::processFinalResult(Callback cb) const {
                             }
                         }  // for edges
                     }  // for edata
-                }   // for `vdata'
-            }  // extend input rows
+                    return true;
+                };
+
+                if (fromType_ == kInstantExpr) {
+                    if (!func()) {
+                        return false;
+                    }
+                } else {
+                    const auto roots = getRoots(srcId, recordIn);
+                    auto inputRows = index_->rowsOfVids(roots);
+                    for (auto row : inputRows) {
+                        inputRow = row;
+                        if (!func()) {
+                            return false;
+                        }
+                    }
+                }
+            }  // for vdata
         }   // for `resp'
     }
     return true;
 }
 
-OptVariantType GoExecutor::VertexHolder::getDefaultProp(TagID tid, const std::string &prop) const {
-    for (auto it = data_.cbegin(); it != data_.cend(); ++it) {
-        auto it2 = it->second.find(tid);
-        if (it2 != it->second.cend()) {
-            return RowReader::getDefaultProp(std::get<0>(it2->second).get(), prop);
+OptVariantType GoExecutor::VertexHolder::getDefaultProp(
+    TagID tagId, const std::string &prop) const {
+    auto iter = tagSchemaMap_.find(tagId);
+    if (iter == tagSchemaMap_.end()) {
+        auto space = ectx_->rctx()->session()->space();
+        auto schema = ectx_->schemaManager()->getTagSchema(space, tagId);
+        if (schema == nullptr) {
+            return Status::Error("No tag schema for tagId %d", tagId);
         }
+        tagSchemaMap_.emplace(tagId, schema);
+        return RowReader::getDefaultProp(schema.get(), prop);
     }
-
-
-    return Status::Error("Unknown property: `%s'", prop.c_str());
+    return RowReader::getDefaultProp(iter->second.get(), prop);
 }
 
-SupportedType GoExecutor::VertexHolder::getDefaultPropType(TagID tid,
-                                                           const std::string &prop) const {
-    for (auto it = data_.cbegin(); it != data_.cend(); ++it) {
-        auto it2 = it->second.find(tid);
-        if (it2 != it->second.cend()) {
-            return std::get<0>(it2->second)->getFieldType(prop).type;
-        }
-    }
-
-    return nebula::cpp2::SupportedType::UNKNOWN;
-}
-
-OptVariantType GoExecutor::VertexHolder::get(VertexID id, TagID tid,
-                                             const std::string &prop) const {
-    auto iter = data_.find(id);
+OptVariantType GoExecutor::VertexHolder::get(
+    VertexID id, TagID tid, const std::string &prop) const {
+    auto iter = data_.find(std::make_pair(id, tid));
     if (iter == data_.end()) {
         return getDefaultProp(tid, prop);
     }
 
-    auto iter2 = iter->second.find(tid);
-    if (iter2 == iter->second.end()) {
-        return getDefaultProp(tid, prop);
-    }
-
-    auto reader = RowReader::getRowReader(std::get<1>(iter2->second), std::get<0>(iter2->second));
+    auto &reader = iter->second;
 
     auto res = RowReader::getPropByName(reader.get(), prop);
     if (!ok(res)) {
@@ -1311,44 +1365,54 @@ OptVariantType GoExecutor::VertexHolder::get(VertexID id, TagID tid,
     return value(std::move(res));
 }
 
-SupportedType GoExecutor::VertexHolder::getType(VertexID id, TagID tid, const std::string &prop) {
-    auto iter = data_.find(id);
-    if (iter == data_.end()) {
-        return getDefaultPropType(tid, prop);
-    }
-
-    auto iter2 = iter->second.find(tid);
-    if (iter2 == iter->second.end()) {
-        return getDefaultPropType(tid, prop);
-    }
-
-    return std::get<0>(iter2->second)->getFieldType(prop).type;
-}
-
-void GoExecutor::VertexHolder::add(const storage::cpp2::QueryResponse &resp) {
-    auto *vertices = resp.get_vertices();
-    if (vertices == nullptr) {
-        return;
-    }
-
-    auto *vertexSchema = resp.get_vertex_schema();
-    if (vertexSchema == nullptr) {
-        return;
-    }
-    for (auto &vdata : *vertices) {
-        std::unordered_map<TagID, VData> m;
-        for (auto &td : vdata.tag_data) {
-            DCHECK(td.__isset.data);
-            auto it = vertexSchema->find(td.tag_id);
-            DCHECK(it != vertexSchema->end());
-            m[td.tag_id] = {std::make_shared<ResultSchemaProvider>(it->second), td.data};
+void GoExecutor::VertexHolder::add(
+    const std::vector<storage::cpp2::QueryResponse> &responses) {
+    size_t num = 0;
+    for (auto& resp : responses) {
+        if (!resp.__isset.vertices || !resp.__isset.vertex_schema) {
+            continue;
         }
-        data_[vdata.vertex_id] = std::move(m);
+        for (auto &vdata : resp.vertices) {
+            num += vdata.tag_data.size();
+        }
+    }
+
+    data_.reserve(num);
+
+    for (auto& resp : responses) {
+        if (!resp.__isset.vertices || !resp.__isset.vertex_schema) {
+            continue;
+        }
+
+        std::transform(
+            resp.vertex_schema.cbegin(),
+            resp.vertex_schema.cend(),
+            std::inserter(
+                tagSchemaMap_,
+                tagSchemaMap_.begin()),
+            [] (auto &s) {
+                return std::make_pair(
+                    s.first,
+                    std::make_shared<ResultSchemaProvider>(s.second));
+            });
+
+        for (auto &vdata : resp.vertices) {
+            auto vid = vdata.get_vertex_id();
+            for (auto &td : vdata.tag_data) {
+                DCHECK(td.__isset.data);
+                auto tagId = td.tag_id;
+                auto it = tagSchemaMap_.find(tagId);
+                DCHECK(it != tagSchemaMap_.end());
+                auto &vschema = it->second;
+                auto vreader = RowReader::getRowReader(td.data, vschema);
+                data_.emplace(std::make_pair(vid, tagId), std::move(vreader));
+            }
+        }
     }
 }
 
 void GoExecutor::joinResp(RpcResponse &&resp) {
-    records_.emplace_back(resp);
+    records_.emplace_back(std::move(resp));
 }
 
 }   // namespace graph

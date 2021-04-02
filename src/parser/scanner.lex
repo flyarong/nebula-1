@@ -132,6 +132,7 @@ OF                          ([Oo][Ff])
 DATA                        ([Dd][Aa][Tt][Aa])
 STOP                        ([Ss][Tt][Oo][Pp])
 SHORTEST                    ([Ss][Hh][Oo][Rr][Tt][Ee][Ss][Tt])
+NOLOOP                      ([Nn][Oo][Ll][Oo][Oo][Pp])
 PATH                        ([Pp][Aa][Tt][Hh])
 LIMIT                       ([Ll][Ii][Mm][Ii][Tt])
 OFFSET                      ([Oo][Ff][Ff][Ss][Ee][Tt])
@@ -143,9 +144,9 @@ AVG                         ([Aa][Vv][Gg])
 MIN                         ([Mm][Ii][Nn])
 MAX                         ([Mm][Aa][Xx])
 STD                         ([Ss][Tt][Dd])
-BIT_AND                     ([Bb][It][Tt][_][Aa][Nn][Dd])
-BIT_OR                      ([Bb][It][Tt][_][Oo][Rr])
-BIT_XOR                     ([Bb][It][Tt][_][Xx][Oo][Rr])
+BIT_AND                     ([Bb][Ii][Tt][_][Aa][Nn][Dd])
+BIT_OR                      ([Bb][Ii][Tt][_][Oo][Rr])
+BIT_XOR                     ([Bb][Ii][Tt][_][Xx][Oo][Rr])
 IS                          ([Ii][Ss])
 NULL                        ([Nn][Uu][Ll][Ll])
 SNAPSHOT                    ([Ss][Nn][Aa][Pp][Ss][Hh][Oo][Tt])
@@ -306,6 +307,7 @@ RECOVER                     ([Rr][Ee][Cc][Oo][Vv][Ee][Rr])
 {GRAPH}                     { return TokenType::KW_GRAPH; }
 {META}                      { return TokenType::KW_META; }
 {STORAGE}                   { return TokenType::KW_STORAGE; }
+{NOLOOP}                    { return TokenType::KW_NOLOOP; }
 {SHORTEST}                  { return TokenType::KW_SHORTEST; }
 {CONTAINS}                  { return TokenType::KW_CONTAINS; }
 
